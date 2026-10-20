@@ -152,7 +152,7 @@ func acquireInstanceLock(socketPath string) (*os.File, error) {
 		lockFile.Close()
 		return nil, fmt.Errorf("chmod daemon lock %s: %w", lockPath, err)
 	}
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := lockFileExclusive(lockFile); err != nil {
 		lockFile.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
 			return nil, fmt.Errorf("another doubletake daemon is already running for %s", socketPath)
@@ -166,7 +166,7 @@ func releaseInstanceLock(lockFile *os.File) {
 	if lockFile == nil {
 		return
 	}
-	_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	unlockFile(lockFile)
 	_ = lockFile.Close()
 }
 

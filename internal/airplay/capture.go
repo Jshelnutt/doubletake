@@ -19,7 +19,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/godbus/dbus/v5"
@@ -217,6 +216,9 @@ func probeX11CaptureSource(ctx context.Context, display string, cfg CaptureConfi
 // is acquired immediately; X11 needs no external session and is merely
 // validated until Start is called.
 func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation, error) {
+	if useFFmpegCapture() {
+		return prepareFFmpegCapture(ctx, cfg, false)
+	}
 	if err := ValidateVideoCodec(string(cfg.VideoCodec)); err != nil {
 		return nil, err
 	}
@@ -298,6 +300,9 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
 // GStreamer process. It mirrors PrepareCapture for callers that negotiate the
 // receiver canvas between preparation and encoder startup.
 func PrepareTestCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation, error) {
+	if useFFmpegCapture() {
+		return prepareFFmpegCapture(ctx, cfg, true)
+	}
 	if err := ValidateVideoCodec(string(cfg.VideoCodec)); err != nil {
 		return nil, err
 	}
@@ -413,6 +418,13 @@ func (p *CapturePreparation) startWithContextAndCodec(lifetime context.Context, 
 	pwFd := p.pwFd
 	portal := p.portal
 	streamSize := p.streamSize
+	if kind == capturePreparationFFmpeg || kind == capturePreparationFFmpegTest {
+		p.mu.Unlock()
+		if cfg.VideoCodec != VideoCodecH264 {
+			return nil, fmt.Errorf("the ffmpeg capture backend supports H.264 only, not %s", cfg.VideoCodec)
+		}
+		return startPreparedFFmpegCapture(startupCtx, captureCtx, cfg, kind == capturePreparationFFmpegTest)
+	}
 	timestampedOutput := supportsTimestampedVideoOutput(cfg.VideoCodec)
 	p.pwFd = nil
 	p.portal = nil
@@ -779,7 +791,7 @@ func startGStreamerCommand(cmd *exec.Cmd) (<-chan error, error) {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
-		cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+		setChildDeathSignal(cmd)
 		err := cmd.Start()
 		started <- err
 		if err != nil {
