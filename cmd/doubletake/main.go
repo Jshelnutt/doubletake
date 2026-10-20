@@ -80,6 +80,8 @@ func main() {
 	x11WindowID := flag.String("x11-window-id", "", "X11 window id to capture, decimal or 0xhex")
 	x11WindowName := flag.String("x11-window-name", "", "X11 window name to capture; prefer -x11-window-id")
 	noCursor := flag.Bool("no-cursor", false, "Don't show the mouse cursor in the captured video")
+	pairOnly := flag.Bool("pair-only", false, "Exit after pairing and saving credentials (for GUI front ends)")
+	quitOnStdinEOF := flag.Bool("quit-on-stdin-eof", false, "Shut down cleanly when stdin is closed (for GUI front ends on Windows, which cannot send SIGINT)")
 	flag.Parse()
 	if err := airplay.ValidateHWAccel(*hwaccel); err != nil {
 		log.Fatalf("invalid -hwaccel: %v", err)
@@ -149,6 +151,13 @@ func main() {
 		log.Println("forced exit")
 		os.Exit(1)
 	}()
+
+	if *quitOnStdinEOF {
+		go func() {
+			_, _ = io.Copy(io.Discard, os.Stdin)
+			sigCh <- os.Interrupt
+		}()
+	}
 
 	var addr string
 	var advertisement *airplay.AirPlayDevice
@@ -309,6 +318,9 @@ func main() {
 		}
 	}
 	log.Println("pairing complete")
+	if *pairOnly {
+		return
+	}
 
 	// FairPlay setup — establishes fp-setup state and ekey/eiv used for the
 	// final encrypted mirror stream. Pair-verify and FairPlay are both needed

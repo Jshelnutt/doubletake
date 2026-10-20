@@ -251,6 +251,10 @@ func StartAudioCapture(ctx context.Context, testTone bool, codec AudioCodec) (*A
 	}
 	_, codecSPF, _, _, _, _ := codec.Info()
 
+	if useExternalAudio() {
+		return startExternalAudioCapture(captureCtx, cancel, testTone, codec)
+	}
+
 	// Detect audio source
 	var srcArgs []string
 	if testTone {
@@ -1788,4 +1792,36 @@ videoReady:
 				frameCount, frameSeq-1, n, frameRTP, payload[:hexStart])
 		}
 	}
+}
+
+// startExternalAudioCapture wires a non-GStreamer PCM producer (WASAPI
+// loopback or ffmpeg) into AudioCapture's untimestamped read path.
+func startExternalAudioCapture(captureCtx context.Context, cancel context.CancelFunc, testTone bool, codec AudioCodec) (*AudioCapture, error) {
+	ac := &AudioCapture{cancel: cancel, waitCh: make(chan struct{}), codec: codec}
+	if codec == AudioCodecALAC {
+		ac.alac = &alacEncoder{}
+	} else if codec == AudioCodecAACELD {
+		var err error
+		ac.eld, err = newELDEncoder()
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+	}
+	pcm, cmd, wait, err := startExternalPCM(captureCtx, testTone)
+	if err != nil {
+		if ac.eld != nil {
+			ac.eld.Close()
+			ac.eld = nil
+		}
+		cancel()
+		return nil, fmt.Errorf("start audio capture: %w", err)
+	}
+	ac.gstCmd = cmd
+	ac.pcmPipe = pcm
+	go func() {
+		ac.waitErr = <-wait
+		close(ac.waitCh)
+	}()
+	return ac, nil
 }
