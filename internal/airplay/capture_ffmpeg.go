@@ -16,6 +16,7 @@ package airplay
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -85,9 +86,96 @@ var (
 	ffmpegProbeResults sync.Map // encoder -> bool
 )
 
+var (
+	ffmpegListedOnce sync.Once
+	ffmpegListed     map[string]bool
+)
+
+// ffmpegEncoderListed reports whether this ffmpeg build contains the encoder
+// at all (one "ffmpeg -encoders" call), so absent ones are never probed.
+func ffmpegEncoderListed(name string) bool {
+	ffmpegListedOnce.Do(func() {
+		cmd := exec.Command(FFmpegPath(), "-hide_banner", "-encoders")
+		cmd.SysProcAttr = hiddenWindowAttr()
+		out, err := cmd.Output()
+		if err != nil {
+			return
+		}
+		ffmpegListed = map[string]bool{}
+		for _, line := range strings.Split(string(out), "\n") {
+			f := strings.Fields(line)
+			if len(f) >= 2 && len(f[0]) == 6 {
+				ffmpegListed[f[1]] = true
+			}
+		}
+	})
+	return ffmpegListed == nil || ffmpegListed[name]
+}
+
+// Probe results are cached on disk per ffmpeg binary (path, size, mtime), so
+// encoders that fail on this PC (e.g. AMF on an Intel/Nvidia laptop) cost
+// nothing on later runs. Delete the cache file to re-probe.
+func ffmpegProbeCachePath() (string, string) {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return "", ""
+	}
+	key := FFmpegPath()
+	if p, err := exec.LookPath(FFmpegPath()); err == nil {
+		if st, err := os.Stat(p); err == nil {
+			key = fmt.Sprintf("%s|%d|%d", p, st.Size(), st.ModTime().Unix())
+		}
+	}
+	return filepath.Join(dir, "doubletake", "encoder-probe.json"), key
+}
+
+func loadFFmpegProbeCache() map[string]bool {
+	path, key := ffmpegProbeCachePath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var c struct {
+		Key     string          `json:"key"`
+		Results map[string]bool `json:"results"`
+	}
+	if json.Unmarshal(data, &c) != nil || c.Key != key {
+		return nil
+	}
+	return c.Results
+}
+
+func saveFFmpegProbeCache() {
+	path, key := ffmpegProbeCachePath()
+	if path == "" {
+		return
+	}
+	results := map[string]bool{}
+	ffmpegProbeResults.Range(func(k, v any) bool { results[k.(string)] = v.(bool); return true })
+	data, _ := json.Marshal(struct {
+		Key     string          `json:"key"`
+		Results map[string]bool `json:"results"`
+	}{key, results})
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	_ = os.WriteFile(path, data, 0o644)
+}
+
+var ffmpegCacheOnce sync.Once
+
 func ffmpegEncoderWorks(name string) bool {
+	ffmpegCacheOnce.Do(func() {
+		for k, v := range loadFFmpegProbeCache() {
+			ffmpegProbeResults.Store(k, v)
+		}
+	})
 	if v, ok := ffmpegProbeResults.Load(name); ok {
 		return v.(bool)
+	}
+	if !ffmpegEncoderListed(name) {
+		dbg("[CAPTURE] encoder %s not in this ffmpeg build; skipping", name)
+		ffmpegProbeResults.Store(name, false)
+		saveFFmpegProbeCache()
+		return false
 	}
 	cmd := exec.Command(FFmpegPath(), "-hide_banner", "-loglevel", "error",
 		"-f", "lavfi", "-i", "color=c=black:s=320x240:r=30:d=0.2",
@@ -103,6 +191,7 @@ func ffmpegEncoderWorks(name string) bool {
 		log.Printf("[CAPTURE] encoder %s unavailable: %v %s", name, err, msg)
 	}
 	ffmpegProbeResults.Store(name, ok)
+	saveFFmpegProbeCache()
 	return ok
 }
 
