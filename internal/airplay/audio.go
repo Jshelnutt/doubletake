@@ -136,6 +136,9 @@ type AudioCapture struct {
 	pcmMaxStep      [audioChannels]int32
 	pcmLargeSteps   [audioChannels]uint64
 	pcmSilentFrames uint64
+	statFrames      int
+	statPeak        int
+	statSince       time.Time
 	pcmZeroRun      uint64
 	pcmMaxZeroRun   uint64
 	eldMu           sync.Mutex
@@ -392,6 +395,7 @@ func (ac *AudioCapture) readFramePosition(buf []byte) (int, audioPCMFramePositio
 	if DebugMode() {
 		ac.recordPCMLevels(pcm)
 	}
+	ac.reportSendStats(pcm)
 	if ac.codec == AudioCodecAACELD {
 		ac.eldMu.Lock()
 		defer ac.eldMu.Unlock()
@@ -1824,4 +1828,31 @@ func startExternalAudioCapture(captureCtx context.Context, cancel context.Cancel
 		close(ac.waitCh)
 	}()
 	return ac, nil
+}
+
+// reportSendStats logs, every 5 s, how many PCM frames reached the AirPlay
+// encoder and their peak level, so "no sound" can be split into capture vs
+// network problems from a normal (non -debug) log.
+func (ac *AudioCapture) reportSendStats(pcm []byte) {
+	ac.statFrames++
+	for i := 0; i+1 < len(pcm); i += 2 {
+		v := int(int16(uint16(pcm[i]) | uint16(pcm[i+1])<<8))
+		if v < 0 {
+			v = -v
+		}
+		if v > ac.statPeak {
+			ac.statPeak = v
+		}
+	}
+	now := time.Now()
+	if ac.statSince.IsZero() {
+		ac.statSince = now
+		return
+	}
+	if d := now.Sub(ac.statSince); d >= 5*time.Second {
+		log.Printf("[AUDIO] sender last %.0fs: %d audio frames encoded/sent (%s), peak level %.1f%%",
+			d.Seconds(), ac.statFrames, map[AudioCodec]string{AudioCodecALAC: "ALAC", AudioCodecAACELD: "AAC-ELD"}[ac.codec],
+			float64(ac.statPeak)*100/32767)
+		ac.statFrames, ac.statPeak, ac.statSince = 0, 0, now
+	}
 }

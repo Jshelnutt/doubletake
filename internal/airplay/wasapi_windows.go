@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
+	"os"
 	"runtime"
 	"syscall"
 	"time"
@@ -21,7 +21,6 @@ import (
 const (
 	audclntStreamflagsAutoconvertPCM    = 0x80000000
 	audclntStreamflagsSrcDefaultQuality = 0x08000000
-	waveFormatIEEEFloat                 = 0x0003
 	waveFormatExtensible                = 0xFFFE
 	wasapiBufferDuration                = wca.REFERENCE_TIME(200 * 10000) // 200 ms in 100-ns units
 )
@@ -105,11 +104,17 @@ func runWASAPILoopback(ctx context.Context, out *io.PipeWriter, ready chan<- err
 	}
 	conv := false
 	var mix *wca.WAVEFORMATEX
-	initErr := ac.Initialize(wca.AUDCLNT_SHAREMODE_SHARED,
-		wca.AUDCLNT_STREAMFLAGS_LOOPBACK|audclntStreamflagsAutoconvertPCM|audclntStreamflagsSrcDefaultQuality,
-		wasapiBufferDuration, 0, &want, nil)
+	// Default: open the device in its native mix format (normally 48 kHz
+	// float32) and convert in software. Windows' AUTOCONVERTPCM on a loopback
+	// stream proved unreliable (stream opened but stayed silent on a Win11
+	// laptop), so it is opt-in via DOUBLETAKE_WASAPI_AUTOCONVERT=1.
+	initErr := fmt.Errorf("auto-convert not requested")
+	if os.Getenv("DOUBLETAKE_WASAPI_AUTOCONVERT") == "1" {
+		initErr = ac.Initialize(wca.AUDCLNT_SHAREMODE_SHARED,
+			wca.AUDCLNT_STREAMFLAGS_LOOPBACK|audclntStreamflagsAutoconvertPCM|audclntStreamflagsSrcDefaultQuality,
+			wasapiBufferDuration, 0, &want, nil)
+	}
 	if initErr != nil {
-		log.Printf("[AUDIO] WASAPI auto-convert unavailable (%v); converting the mix format in software", initErr)
 		ac.Release()
 		if ac, e = activateAudioClient(dev); e != nil {
 			return fail(fmt.Errorf("re-activate audio client: %w", e))
@@ -135,7 +140,12 @@ func runWASAPILoopback(ctx context.Context, out *io.PipeWriter, ready chan<- err
 	defer ac.Stop()
 	signalled = true
 	ready <- nil
-	log.Printf("[AUDIO] capturing Windows system audio (WASAPI loopback, convert=%v)", conv)
+	if conv {
+		log.Printf("[AUDIO] capturing Windows system audio (WASAPI loopback, mix format tag=0x%x %d Hz %d ch %d-bit, software convert to 44.1 kHz s16)",
+			mix.WFormatTag, mix.NSamplesPerSec, mix.NChannels, mix.WBitsPerSample)
+	} else {
+		log.Printf("[AUDIO] capturing Windows system audio (WASAPI loopback, Windows auto-convert to 44.1 kHz s16)")
+	}
 
 	var cv *mixConverter
 	if conv {
@@ -147,6 +157,9 @@ func runWASAPILoopback(ctx context.Context, out *io.PipeWriter, ready chan<- err
 
 	start := time.Now()
 	var written int64 // output frames
+	var realFrames, fillFrames, packets, silentFlagged int64
+	var peak int
+	lastReport := time.Now()
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 	silence := make([]byte, 4096*4)
@@ -183,6 +196,20 @@ func runWASAPILoopback(ctx context.Context, out *io.PipeWriter, ready chan<- err
 				}
 			}
 			_ = acc.ReleaseBuffer(frames)
+			packets++
+			if flags&wca.AUDCLNT_BUFFERFLAGS_SILENT != 0 {
+				silentFlagged++
+			}
+			for i := 0; i+1 < len(pcm); i += 2 {
+				v := int(int16(binary.LittleEndian.Uint16(pcm[i:])))
+				if v < 0 {
+					v = -v
+				}
+				if v > peak {
+					peak = v
+				}
+			}
+			realFrames += int64(len(pcm) / 4)
 			if len(pcm) > 0 {
 				if _, e := out.Write(pcm); e != nil {
 					return nil // reader closed: normal stop
@@ -190,6 +217,12 @@ func runWASAPILoopback(ctx context.Context, out *io.PipeWriter, ready chan<- err
 				written += int64(len(pcm) / 4)
 				gotData = true
 			}
+		}
+		if time.Since(lastReport) >= 5*time.Second {
+			log.Printf("[AUDIO] WASAPI last %.0fs: %d packets (%d flagged silent), %d captured frames, %d silence-fill frames, peak level %.1f%%",
+				time.Since(lastReport).Seconds(), packets, silentFlagged, realFrames, fillFrames, float64(peak)*100/32767)
+			packets, silentFlagged, realFrames, fillFrames, peak = 0, 0, 0, 0, 0
+			lastReport = time.Now()
 		}
 		// Keep the timeline moving during silence (no packets at all).
 		if !gotData {
@@ -204,6 +237,7 @@ func runWASAPILoopback(ctx context.Context, out *io.PipeWriter, ready chan<- err
 						return nil
 					}
 					written += n
+					fillFrames += n
 					due -= n
 				}
 			}
@@ -214,18 +248,6 @@ func runWASAPILoopback(ctx context.Context, out *io.PipeWriter, ready chan<- err
 	}
 }
 
-// mixConverter turns the device mix format (usually 32-bit float, 48 kHz,
-// 2+ channels) into S16LE 44.1 kHz stereo with linear resampling.
-type mixConverter struct {
-	isFloat  bool
-	bits     int
-	channels int
-	inRate   float64
-	pos      float64 // fractional input position carried across buffers
-	prev     [2]float64
-	havePrev bool
-}
-
 func newMixConverter(f *wca.WAVEFORMATEX) *mixConverter {
 	tag := f.WFormatTag
 	if tag == waveFormatExtensible {
@@ -233,71 +255,5 @@ func newMixConverter(f *wca.WAVEFORMATEX) *mixConverter {
 		ext := unsafe.Slice((*byte)(unsafe.Pointer(f)), 18+22)
 		tag = binary.LittleEndian.Uint16(ext[24:26])
 	}
-	c := &mixConverter{bits: int(f.WBitsPerSample), channels: int(f.NChannels), inRate: float64(f.NSamplesPerSec)}
-	switch {
-	case tag == waveFormatIEEEFloat && c.bits == 32:
-		c.isFloat = true
-	case tag == wca.WAVE_FORMAT_PCM && (c.bits == 16 || c.bits == 24 || c.bits == 32):
-	default:
-		return nil
-	}
-	if c.channels < 1 {
-		return nil
-	}
-	return c
-}
-
-func (c *mixConverter) sample(raw []byte, frame, ch int) float64 {
-	if ch >= c.channels {
-		ch = 0
-	}
-	bps := c.bits / 8
-	off := (frame*c.channels + ch) * bps
-	switch {
-	case c.isFloat:
-		return float64(math.Float32frombits(binary.LittleEndian.Uint32(raw[off:])))
-	case c.bits == 16:
-		return float64(int16(binary.LittleEndian.Uint16(raw[off:]))) / 32768
-	case c.bits == 24:
-		v := int32(raw[off]) | int32(raw[off+1])<<8 | int32(int8(raw[off+2]))<<16
-		return float64(v) / 8388608
-	default:
-		return float64(int32(binary.LittleEndian.Uint32(raw[off:]))) / 2147483648
-	}
-}
-
-func (c *mixConverter) convert(raw []byte, frames int, silent bool) []byte {
-	step := c.inRate / audioSampleRate
-	out := make([]byte, 0, int(float64(frames)/step+2)*4)
-	get := func(i, ch int) float64 {
-		if silent {
-			return 0
-		}
-		if i < 0 {
-			return c.prev[ch]
-		}
-		return c.sample(raw, i, ch)
-	}
-	for c.pos < float64(frames-1) {
-		i := int(math.Floor(c.pos))
-		t := c.pos - float64(i)
-		for ch := 0; ch < 2; ch++ {
-			a, b := get(i, ch), get(i+1, ch)
-			v := a + (b-a)*t
-			if v > 1 {
-				v = 1
-			} else if v < -1 {
-				v = -1
-			}
-			out = binary.LittleEndian.AppendUint16(out, uint16(int16(math.Round(v*32767))))
-		}
-		c.pos += step
-	}
-	if frames > 0 {
-		for ch := 0; ch < 2; ch++ {
-			c.prev[ch] = get(frames-1, ch)
-		}
-	}
-	c.pos -= float64(frames)
-	return out
+	return newMixConverterFor(tag, int(f.WBitsPerSample), int(f.NChannels), float64(f.NSamplesPerSec))
 }
