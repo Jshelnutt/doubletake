@@ -106,8 +106,19 @@ func ffmpegEncoderWorks(name string) bool {
 	return ok
 }
 
-// selectFFmpegEncoder returns the candidate encoders for a -hwaccel value.
+// selectFFmpegEncoder returns the first working encoder for a -hwaccel value.
 func selectFFmpegEncoder(hwaccel string) (string, error) {
+	list, err := workingFFmpegEncoders(hwaccel)
+	if err != nil {
+		return "", err
+	}
+	return list[0], nil
+}
+
+// workingFFmpegEncoders returns every encoder for a -hwaccel value that passes
+// a quick probe, best first. Capture falls through them if a real capture
+// start fails (e.g. NVENC rejecting frames from an Intel-owned display).
+func workingFFmpegEncoders(hwaccel string) ([]string, error) {
 	var candidates []string
 	switch hwaccel {
 	case "nvenc":
@@ -121,12 +132,16 @@ func selectFFmpegEncoder(hwaccel string) (string, error) {
 	default:
 		candidates = []string{"h264_nvenc", "h264_qsv", "h264_amf", "libx264", "libopenh264"}
 	}
+	var ok []string
 	for _, c := range candidates {
 		if ffmpegEncoderWorks(c) {
-			return c, nil
+			ok = append(ok, c)
 		}
 	}
-	return "", fmt.Errorf("no working ffmpeg H.264 encoder among %v", candidates)
+	if len(ok) == 0 {
+		return nil, fmt.Errorf("no working ffmpeg H.264 encoder among %v", candidates)
+	}
+	return ok, nil
 }
 
 func ffmpegEncoderArgs(encoder string, bitrateKbps, fps int) []string {
@@ -143,8 +158,10 @@ func ffmpegEncoderArgs(encoder string, bitrateKbps, fps int) []string {
 		args = []string{"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
 			"-profile:v", "high", "-x264-params", "repeat-headers=1:sliced-threads=1"}
 	case "h264_nvenc":
-		args = []string{"-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ull", "-zerolatency", "1",
-			"-delay", "0", "-rc", "cbr", "-profile:v", "high", "-forced-idr", "1"}
+		// Kept to options every NVENC SDK since 2021 accepts; "-delay 0" and
+		// "-rc cbr" caused EINVAL (-22) on some driver/ffmpeg pairs.
+		args = []string{"-c:v", "h264_nvenc", "-preset", "p2", "-tune", "ll", "-zerolatency", "1",
+			"-profile:v", "high", "-forced-idr", "1"}
 	case "h264_qsv":
 		args = []string{"-c:v", "h264_qsv", "-preset", "veryfast", "-async_depth", "1", "-look_ahead", "0", "-profile:v", "high"}
 	case "h264_amf":
@@ -228,24 +245,26 @@ func startPreparedFFmpegCapture(startupCtx, lifetimeCtx context.Context, cfg Cap
 	if fps <= 0 {
 		fps = 30
 	}
-	encoder, err := selectFFmpegEncoder(cfg.HWAccel)
+	encoders, err := workingFFmpegEncoders(cfg.HWAccel)
 	if err != nil {
 		return nil, err
 	}
-	bitrate := captureBitrateKbps(cfg)
-	if cfg.Bitrate <= 0 && encoder != "libx264" && encoder != "libopenh264" && bitrate < 8000 {
-		// Hardware encoders are cheap; spend more bits for sharper text.
-		bitrate = 8000
-	}
 	var errs []string
-	for _, plan := range ffmpegInputPlans(cfg, fps, test) {
-		capture, err := startFFmpegCaptureAttempt(startupCtx, lifetimeCtx, plan, encoder, cfg, fps, bitrate)
-		if err == nil {
-			log.Printf("[CAPTURE] ffmpeg %s capture with %s at %d fps, %d kbps", plan.name, encoder, fps, bitrate)
-			return capture, nil
+	for _, encoder := range encoders {
+		bitrate := captureBitrateKbps(cfg)
+		if cfg.Bitrate <= 0 && encoder != "libx264" && encoder != "libopenh264" && bitrate < 8000 {
+			// Hardware encoders are cheap; spend more bits for sharper text.
+			bitrate = 8000
 		}
-		log.Printf("[CAPTURE] ffmpeg %s capture failed: %v", plan.name, err)
-		errs = append(errs, fmt.Sprintf("%s: %v", plan.name, err))
+		for _, plan := range ffmpegInputPlans(cfg, fps, test) {
+			capture, err := startFFmpegCaptureAttempt(startupCtx, lifetimeCtx, plan, encoder, cfg, fps, bitrate)
+			if err == nil {
+				log.Printf("[CAPTURE] ffmpeg %s capture with %s at %d fps, %d kbps", plan.name, encoder, fps, bitrate)
+				return capture, nil
+			}
+			log.Printf("[CAPTURE] ffmpeg %s capture with %s failed: %v", plan.name, encoder, err)
+			errs = append(errs, fmt.Sprintf("%s/%s: %v", plan.name, encoder, err))
+		}
 	}
 	return nil, fmt.Errorf("ffmpeg screen capture failed: %s", strings.Join(errs, "; "))
 }
