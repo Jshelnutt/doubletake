@@ -93,7 +93,15 @@ func ffmpegEncoderWorks(name string) bool {
 		"-f", "lavfi", "-i", "color=c=black:s=320x240:r=30:d=0.2",
 		"-pix_fmt", "yuv420p", "-c:v", name, "-f", "null", "-")
 	cmd.SysProcAttr = hiddenWindowAttr()
-	ok := cmd.Run() == nil
+	out, err := cmd.CombinedOutput()
+	ok := err == nil
+	if !ok {
+		msg := strings.TrimSpace(string(out))
+		if len(msg) > 300 {
+			msg = msg[len(msg)-300:]
+		}
+		log.Printf("[CAPTURE] encoder %s unavailable: %v %s", name, err, msg)
+	}
 	ffmpegProbeResults.Store(name, ok)
 	return ok
 }
@@ -138,7 +146,7 @@ func ffmpegEncoderArgs(encoder string, bitrateKbps, fps int) []string {
 		args = []string{"-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ull", "-zerolatency", "1",
 			"-delay", "0", "-rc", "cbr", "-profile:v", "high", "-forced-idr", "1"}
 	case "h264_qsv":
-		args = []string{"-c:v", "h264_qsv", "-preset", "veryfast", "-async_depth", "1", "-low_power", "0", "-profile:v", "high"}
+		args = []string{"-c:v", "h264_qsv", "-preset", "veryfast", "-async_depth", "1", "-look_ahead", "0", "-profile:v", "high"}
 	case "h264_amf":
 		args = []string{"-c:v", "h264_amf", "-usage", "ultralowlatency", "-quality", "speed", "-profile:v", "high"}
 	default:
@@ -225,6 +233,10 @@ func startPreparedFFmpegCapture(startupCtx, lifetimeCtx context.Context, cfg Cap
 		return nil, err
 	}
 	bitrate := captureBitrateKbps(cfg)
+	if cfg.Bitrate <= 0 && encoder != "libx264" && encoder != "libopenh264" && bitrate < 8000 {
+		// Hardware encoders are cheap; spend more bits for sharper text.
+		bitrate = 8000
+	}
 	var errs []string
 	for _, plan := range ffmpegInputPlans(cfg, fps, test) {
 		capture, err := startFFmpegCaptureAttempt(startupCtx, lifetimeCtx, plan, encoder, cfg, fps, bitrate)
