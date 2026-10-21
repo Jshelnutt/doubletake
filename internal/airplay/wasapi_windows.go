@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"runtime"
 	"syscall"
@@ -159,7 +160,22 @@ func runWASAPILoopback(ctx context.Context, out *io.PipeWriter, ready chan<- err
 	var written int64 // output frames
 	var realFrames, fillFrames, packets, silentFlagged int64
 	var peak int
+	var sumSq float64
+	var sumN int64
 	lastReport := time.Now()
+	report := func() {
+		if time.Since(lastReport) < 5*time.Second {
+			return
+		}
+		rms := 0.0
+		if sumN > 0 {
+			rms = math.Sqrt(sumSq/float64(sumN)) * 100 / 32767
+		}
+		log.Printf("[AUDIO] WASAPI last %.0fs: %d packets (%d flagged silent), %d captured frames, %d silence-fill frames, peak %.1f%% rms %.1f%%",
+			time.Since(lastReport).Seconds(), packets, silentFlagged, realFrames, fillFrames, float64(peak)*100/32767, rms)
+		packets, silentFlagged, realFrames, fillFrames, peak, sumSq, sumN = 0, 0, 0, 0, 0, 0, 0
+		lastReport = time.Now()
+	}
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 	silence := make([]byte, 4096*4)
@@ -208,6 +224,8 @@ func runWASAPILoopback(ctx context.Context, out *io.PipeWriter, ready chan<- err
 				if v > peak {
 					peak = v
 				}
+				sumSq += float64(v) * float64(v)
+				sumN++
 			}
 			realFrames += int64(len(pcm) / 4)
 			if len(pcm) > 0 {
@@ -217,13 +235,12 @@ func runWASAPILoopback(ctx context.Context, out *io.PipeWriter, ready chan<- err
 				written += int64(len(pcm) / 4)
 				gotData = true
 			}
+			// The pipe write blocks at the receiver's real-time pace, so while
+			// sound is playing this inner loop may never see an empty queue;
+			// report from here too.
+			report()
 		}
-		if time.Since(lastReport) >= 5*time.Second {
-			log.Printf("[AUDIO] WASAPI last %.0fs: %d packets (%d flagged silent), %d captured frames, %d silence-fill frames, peak level %.1f%%",
-				time.Since(lastReport).Seconds(), packets, silentFlagged, realFrames, fillFrames, float64(peak)*100/32767)
-			packets, silentFlagged, realFrames, fillFrames, peak = 0, 0, 0, 0, 0
-			lastReport = time.Now()
-		}
+		report()
 		// Keep the timeline moving during silence (no packets at all).
 		if !gotData {
 			due := int64(time.Since(start).Seconds()*audioSampleRate) - written

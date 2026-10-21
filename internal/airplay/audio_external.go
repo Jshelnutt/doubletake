@@ -56,3 +56,12 @@ func startExternalPCM(ctx context.Context, testTone bool) (io.ReadCloser, *exec.
 	go logStderr("AUDIO-FFMPEG", stderr)
 	return stdout, cmd, wait, nil
 }
+
+// StartSystemAudioPCM starts the platform system-audio capture on its own and
+// returns raw S16LE 44.1 kHz stereo PCM. doubletake -pcm-stdout uses it so a
+// front end can send the sound to a different speaker (e.g. HomePods) than the
+// one receiving the picture.
+func StartSystemAudioPCM(ctx context.Context, testTone bool) (io.ReadCloser, <-chan error, error) {
+	r, _, done, err := startExternalPCM(ctx, testTone)
+	return r, done, err
+}

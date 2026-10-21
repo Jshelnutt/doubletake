@@ -139,6 +139,8 @@ type AudioCapture struct {
 	statFrames      int
 	statPeak        int
 	statSince       time.Time
+	statSumSq       float64
+	statN           int64
 	pcmZeroRun      uint64
 	pcmMaxZeroRun   uint64
 	eldMu           sync.Mutex
@@ -1843,6 +1845,8 @@ func (ac *AudioCapture) reportSendStats(pcm []byte) {
 		if v > ac.statPeak {
 			ac.statPeak = v
 		}
+		ac.statSumSq += float64(v) * float64(v)
+		ac.statN++
 	}
 	now := time.Now()
 	if ac.statSince.IsZero() {
@@ -1850,9 +1854,13 @@ func (ac *AudioCapture) reportSendStats(pcm []byte) {
 		return
 	}
 	if d := now.Sub(ac.statSince); d >= 5*time.Second {
-		log.Printf("[AUDIO] sender last %.0fs: %d audio frames encoded/sent (%s), peak level %.1f%%",
+		rms := 0.0
+		if ac.statN > 0 {
+			rms = math.Sqrt(ac.statSumSq/float64(ac.statN)) * 100 / 32767
+		}
+		log.Printf("[AUDIO] sender last %.0fs: %d audio frames encoded/sent (%s), peak %.1f%% rms %.1f%%",
 			d.Seconds(), ac.statFrames, map[AudioCodec]string{AudioCodecALAC: "ALAC", AudioCodecAACELD: "AAC-ELD"}[ac.codec],
-			float64(ac.statPeak)*100/32767)
-		ac.statFrames, ac.statPeak, ac.statSince = 0, 0, now
+			float64(ac.statPeak)*100/32767, rms)
+		ac.statFrames, ac.statPeak, ac.statSince, ac.statSumSq, ac.statN = 0, 0, now, 0, 0
 	}
 }

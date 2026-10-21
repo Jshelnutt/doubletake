@@ -81,6 +81,7 @@ func main() {
 	x11WindowName := flag.String("x11-window-name", "", "X11 window name to capture; prefer -x11-window-id")
 	noCursor := flag.Bool("no-cursor", false, "Don't show the mouse cursor in the captured video")
 	pairOnly := flag.Bool("pair-only", false, "Exit after pairing and saving credentials (for GUI front ends)")
+	pcmStdout := flag.Bool("pcm-stdout", false, "Only capture system audio and write raw S16LE 44.1 kHz stereo PCM to stdout (for sending sound to separate speakers); stops on stdin EOF")
 	quitOnStdinEOF := flag.Bool("quit-on-stdin-eof", false, "Shut down cleanly when stdin is closed (for GUI front ends on Windows, which cannot send SIGINT)")
 	flag.Parse()
 	if err := airplay.ValidateHWAccel(*hwaccel); err != nil {
@@ -101,6 +102,11 @@ func main() {
 	}
 
 	airplay.SetTargetLatency(time.Duration(*targetLatencyMs) * time.Millisecond)
+
+	if *pcmStdout {
+		runPCMStdout(*testMode)
+		return
+	}
 
 	airplay.SetDebugMode(*debug)
 
@@ -681,5 +687,26 @@ func newCredentialStore(backend, filePath string) (*airplay.CredentialStore, err
 		return airplay.NewCredentialStore(filePath)
 	default:
 		return nil, fmt.Errorf("unknown credential backend %q (use \"file\" or \"keyring\")", backend)
+	}
+}
+
+func runPCMStdout(testTone bool) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() { <-sig; cancel() }()
+	go func() { _, _ = io.Copy(io.Discard, os.Stdin); cancel() }()
+	pcm, done, err := airplay.StartSystemAudioPCM(ctx, testTone)
+	if err != nil {
+		log.Fatalf("audio capture: %v", err)
+	}
+	log.Println("pcm-stdout: streaming system audio as s16le 44100 Hz stereo")
+	go func() { <-ctx.Done(); _ = pcm.Close() }()
+	_, _ = io.Copy(os.Stdout, pcm)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
 	}
 }
