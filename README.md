@@ -2,6 +2,24 @@
 
 AirPlay screen mirroring sender for Linux. Streams your desktop to an Apple TV using the AirPlay mirroring protocol.
 
+## In plain words
+
+This is Judson Shelnutt's copy of [omarroth/doubletake](https://github.com/omarroth/doubletake), a program that sends a computer's screen (and sound) to an Apple TV on the same network.
+
+- The `main` branch is the original Linux program.
+- The `windows` branch is Judson's Windows version. The [Apple TV Cast](https://github.com/Jshelnutt/apple-tv-cast) app uses that Windows version. See [WINDOWS.md](WINDOWS.md) on the `windows` branch for Windows build notes.
+
+This copy does not automatically stay in sync with the original project. Changes here stay on this copy only.
+
+**To build and check it on Linux:**
+
+```
+make
+make test
+```
+
+`make test` runs the project's existing Go tests (`go test ./...`). An automatic test run is already set up in `.github/workflows/ci.yml`.
+
 ## Features
 
 - Full AirPlay mirroring protocol (RTSP/HTTP + encrypted video stream)
